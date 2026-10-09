@@ -120,13 +120,36 @@ end
                 "before": {"start": 1, "end": 3, "start_line": 2},
                 "after": None,
             },
+            navigation_before_line=2,
         )
 
         self.assertIn("selected-object-flash", viewer)
         self.assertIn("<Policy Missing>", viewer)
         self.assertIn("navigationTarget.token", viewer)
         self.assertIn("storageKey+':jump'", viewer)
-        self.assertIn("setTimeout(()=>editor.deltaDecorations(old,[]),2000)", viewer)
+        self.assertIn("const navigationBeforeLine=2", viewer)
+        self.assertIn("editor.revealLineInCenter(start)", viewer)
+        self.assertIn("setTimeout(()=>editor.deltaDecorations(old,[]),3000)", viewer)
+
+    def test_selected_policy_navigation_uses_both_peer_lines(self):
+        viewer = render_side_by_side_document(
+            DiffHunk("policy", set(), set(), []),
+            "a.conf",
+            "b.conf",
+            source_before_lines=["config firewall policy", " edit 10", " next"],
+            source_after_lines=["config firewall policy", " edit 90", " next"],
+            navigation_target={
+                "token": "policy-jump",
+                "before": {"start": 1, "end": 2},
+                "after": {"start": 1, "end": 2},
+            },
+            navigation_before_line=2,
+            navigation_after_line=2,
+        )
+
+        self.assertIn("const navigationBeforeLine=2", viewer)
+        self.assertIn("const navigationAfterLine=2", viewer)
+        self.assertIn("highlight(left,beforeSpan,aLine);highlight(right,afterSpan,bLine);", viewer)
 
     def test_optional_ignore_filters_mask_selected_configuration_lines(self):
         before = '''set config-version 1

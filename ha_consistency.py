@@ -37,7 +37,7 @@ SCOPE_CATEGORIES = {
 }
 
 POLICY_CATEGORIES = {"Firewall Policies", "Proxy Policies", "Local-In Policies"}
-POLICY_MATCH_MODES = ("Policy ID Match", "Functional Match", "Sequence Validation")
+POLICY_MATCH_MODES = ("Policy ID Match", "Functional Match")
 PROFILE_CATEGORIES = {
     "Security Profiles",
     "SSL Inspection Profiles",
@@ -88,6 +88,7 @@ _POLICY_FUNCTION_FIELDS = {
     "nat",
 } | _PROFILE_FIELDS
 _BUILTIN_REFERENCES = {"all", "none", "any", "always", "default"}
+_POLICY_FINGERPRINT_SIMILARITY_THRESHOLD = 0.9
 
 
 @dataclass(frozen=True)
@@ -122,7 +123,6 @@ class HAComparison:
     before_name: str
     after_name: str
     changes: list[HAChange]
-    order_changes: list[str] = field(default_factory=list)
     dependencies: list[dict[str, str]] = field(default_factory=list)
     risks: list[dict[str, str]] = field(default_factory=list)
     cosmetic_changes: list[HAChange] = field(default_factory=list)
@@ -177,7 +177,7 @@ class HAComparison:
 
     @property
     def health_score(self) -> int:
-        total_findings = len(self.changes) + len(self.order_changes)
+        total_findings = len(self.changes)
         if not total_findings:
             return 100
         equivalent_count = sum(change.status == "Equivalent" for change in self.changes)
@@ -208,13 +208,12 @@ def _normalize_line(line: str) -> str:
 
 def _parse_objects(
     config_text: str,
-) -> tuple[dict[str, HAObject], dict[tuple[str, str], list[str]]]:
+) -> dict[str, HAObject]:
     """Index relevant edit blocks without splitting the full file into lines."""
     if not isinstance(config_text, str) or not config_text.strip():
         raise ValueError("The uploaded configuration is empty or is not valid text.")
 
     objects: dict[str, HAObject] = {}
-    order: dict[tuple[str, str], list[str]] = {}
     config_stack: list[str] = []
     edit_stack: list[tuple[int, str]] = []
     active_category: str | None = None
@@ -265,8 +264,6 @@ def _parse_objects(
             cosmetic_lines,
         )
         objects[key] = obj
-        if active_category in POLICY_CATEGORIES:
-            order.setdefault((active_category, active_context), []).append(key)
         active_category = None
         active_id = ""
         active_key = ""
@@ -349,7 +346,7 @@ def _parse_objects(
 
     if active_category is not None:
         finish_object()
-    return objects, order
+    return objects
 
 
 def _object_values(obj: HAObject, fields: set[str]) -> dict[str, list[str]]:
@@ -369,6 +366,20 @@ def _policy_fingerprint(obj: HAObject) -> tuple[tuple[str, tuple[str, ...]], ...
     )
 
 
+def _policy_fingerprint_similarity(before: HAObject, after: HAObject) -> float:
+    before_fingerprint = _policy_fingerprint(before)
+    after_fingerprint = _policy_fingerprint(after)
+    if not before_fingerprint:
+        return 1.0
+    matching_fields = sum(
+        before_value == after_value
+        for (_, before_value), (_, after_value) in zip(
+            before_fingerprint, after_fingerprint
+        )
+    )
+    return matching_fields / len(before_fingerprint)
+
+
 def _pair_policies(
     before_objects: dict[str, HAObject],
     after_objects: dict[str, HAObject],
@@ -380,20 +391,7 @@ def _pair_policies(
     after_unmatched = {obj.key: obj for obj in after_policies}
     pairs: list[tuple[HAObject | None, HAObject | None, str]] = []
 
-    after_by_identity = {
-        (obj.category, obj.context, obj.object_id): obj for obj in after_policies
-    }
-    for before in before_policies:
-        identity = (before.category, before.context, before.object_id)
-        after = after_by_identity.get(identity)
-        if after is None:
-            continue
-        del before_unmatched[before.key]
-        del after_unmatched[after.key]
-        status = "Matching" if before.lines == after.lines else "Modified"
-        pairs.append((before, after, status))
-
-    if mode in {"Functional Match", "Sequence Validation"}:
+    if mode == "Functional Match":
         after_by_fingerprint: dict[tuple[str, str, tuple[tuple[str, tuple[str, ...]], ...]], list[HAObject]] = {}
         for after in after_unmatched.values():
             identity = (after.category, after.context, _policy_fingerprint(after))
@@ -408,58 +406,50 @@ def _pair_policies(
             after = candidates.pop(0)
             del before_unmatched[before.key]
             del after_unmatched[after.key]
+            status = (
+                "Matching"
+                if before.object_id == after.object_id and before.lines == after.lines
+                else "Equivalent"
+            )
+            pairs.append((before, after, status))
+
+        for before in list(before_unmatched.values()):
+            if not before.label.strip():
+                continue
+            candidates = sorted(
+                (
+                    (_policy_fingerprint_similarity(before, after), after)
+                    for after in after_unmatched.values()
+                    if after.category == before.category
+                    and after.context == before.context
+                    and after.label.strip().casefold() == before.label.strip().casefold()
+                ),
+                key=lambda item: (-item[0], item[1].object_id.casefold()),
+            )
+            if not candidates or candidates[0][0] < _POLICY_FINGERPRINT_SIMILARITY_THRESHOLD:
+                continue
+            after = candidates[0][1]
+            del before_unmatched[before.key]
+            del after_unmatched[after.key]
             pairs.append((before, after, "Equivalent"))
+
+    after_by_identity = {
+        (obj.category, obj.context, obj.object_id): obj
+        for obj in after_unmatched.values()
+    }
+    for before in list(before_unmatched.values()):
+        identity = (before.category, before.context, before.object_id)
+        after = after_by_identity.get(identity)
+        if after is None:
+            continue
+        del before_unmatched[before.key]
+        del after_unmatched[after.key]
+        status = "Matching" if before.lines == after.lines else "Modified"
+        pairs.append((before, after, status))
 
     pairs.extend((before, None, "Missing in B") for before in before_unmatched.values())
     pairs.extend((None, after, "Missing in A") for after in after_unmatched.values())
     return pairs
-
-
-def _policy_sequence_differences(
-    before_order: dict[tuple[str, str], list[str]],
-    after_order: dict[tuple[str, str], list[str]],
-    policy_pairs: list[tuple[HAObject | None, HAObject | None, str]],
-) -> list[str]:
-    before_tokens: dict[str, str] = {}
-    after_tokens: dict[str, str] = {}
-    pair_by_token: dict[str, tuple[HAObject, HAObject]] = {}
-    for index, (before, after, _) in enumerate(policy_pairs):
-        if before is None or after is None:
-            continue
-        token = f"policy-pair-{index}"
-        before_tokens[before.key] = token
-        after_tokens[after.key] = token
-        pair_by_token[token] = (before, after)
-
-    differences = []
-    for category, context in sorted(before_order.keys() | after_order.keys()):
-        before_sequence = [
-            before_tokens[key]
-            for key in before_order.get((category, context), ())
-            if key in before_tokens
-        ]
-        after_sequence = [
-            after_tokens[key]
-            for key in after_order.get((category, context), ())
-            if key in after_tokens
-        ]
-        if before_sequence == after_sequence:
-            continue
-        before_positions = {token: index for index, token in enumerate(before_sequence)}
-        after_positions = {token: index for index, token in enumerate(after_sequence)}
-        moved = {
-            token
-            for token in before_positions.keys() & after_positions.keys()
-            if before_positions[token] != after_positions[token]
-        }
-        for token in sorted(moved, key=lambda item: before_positions[item]):
-            before, after = pair_by_token[token]
-            differences.append(
-                f"{category} policy {before.object_id} ↔ {after.object_id} moved from "
-                f"position {before_positions[token] + 1} on Firewall A to "
-                f"position {after_positions[token] + 1} on Firewall B."
-            )
-    return differences
 
 
 def _risk_for_change(change: HAChange) -> tuple[str, str]:
@@ -625,28 +615,6 @@ def _review_guidance(
     )
 
 
-def _find_order_changes(
-    before_order: dict[tuple[str, str], list[str]],
-    after_order: dict[tuple[str, str], list[str]],
-) -> list[str]:
-    changes = []
-    for category in sorted(POLICY_CATEGORIES):
-        contexts = {
-            context
-            for current_category, context in before_order.keys() | after_order.keys()
-            if current_category == category
-        }
-        for context in sorted(contexts):
-            left = before_order.get((category, context), [])
-            right = after_order.get((category, context), [])
-            if left != right:
-                suffix = f" in {context}" if context else ""
-                changes.append(
-                    f"{category} sequence differs between Firewall A and Firewall B{suffix}."
-                )
-    return changes
-
-
 def _dependency_findings(
     before_objects: dict[str, HAObject], after_objects: dict[str, HAObject]
 ) -> list[dict[str, str]]:
@@ -726,8 +694,8 @@ def compare_ha_configurations(
     """Compare in-scope HA objects while excluding device-local sections."""
     if policy_match_mode not in POLICY_MATCH_MODES:
         raise ValueError(f"Unsupported policy comparison mode: {policy_match_mode}")
-    before_objects, before_order = _parse_objects(before_text)
-    after_objects, after_order = _parse_objects(after_text)
+    before_objects = _parse_objects(before_text)
+    after_objects = _parse_objects(after_text)
     policy_pairs = _pair_policies(before_objects, after_objects, policy_match_mode)
     changes: list[HAChange] = []
     cosmetic_changes: list[HAChange] = []
@@ -853,9 +821,6 @@ def compare_ha_configurations(
                 )
             )
 
-    order_changes = _policy_sequence_differences(
-        before_order, after_order, policy_pairs
-    )
     dependencies = _dependency_findings(before_objects, after_objects)
     risks = [
         {
@@ -874,15 +839,10 @@ def compare_ha_configurations(
         }
         for item in dependencies
     )
-    risks.extend(
-        {"Risk": "Medium", "Object": "Policy Order", "Finding": message}
-        for message in order_changes
-    )
     return HAComparison(
         before_name,
         after_name,
         changes,
-        order_changes,
         dependencies,
         risks,
         cosmetic_changes,
@@ -953,8 +913,8 @@ def build_ha_html_report(result: HAComparison) -> bytes:
         "<h1>FortiGate HA Configuration Consistency</h1>",
         f"<p>Firewall A: {html.escape(result.before_name)}<br>Firewall B: {html.escape(result.after_name)}</p>",
         f"<h2>Health Score: {result.health_score}%</h2>",
-        "<table><tr><th>Exact Matches</th><th>Equivalent Matches</th><th>Modified Matches</th><th>Missing Policies</th><th>Sequence Differences</th></tr>",
-        f"<tr><td>{result.exact_policy_count}</td><td>{result.equivalent_policy_count}</td><td>{result.modified_policy_count}</td><td>{result.missing_policy_count}</td><td>{len(result.order_changes)}</td></tr></table>",
+        "<table><tr><th>Exact Matches</th><th>Equivalent Matches</th><th>Modified Matches</th><th>Missing Policies</th></tr>",
+        f"<tr><td>{result.exact_policy_count}</td><td>{result.equivalent_policy_count}</td><td>{result.modified_policy_count}</td><td>{result.missing_policy_count}</td></tr></table>",
         "<h2>Object Differences</h2><table><tr><th>Category</th><th>Object</th><th>Status</th><th>Risk</th></tr>",
     ]
     for change in result.changes:
@@ -985,9 +945,7 @@ def build_ha_html_report(result: HAComparison) -> bytes:
     parts.append("<h2>Cosmetic Differences</h2>")
     for change in result.cosmetic_changes:
         _append_html_finding(parts, change)
-    parts.append("<h2>Policy Order Issues</h2><ul>")
-    parts.extend(f"<li>{html.escape(message)}</li>" for message in result.order_changes)
-    parts.append("</ul><h2>Dependency Validation</h2><ul>")
+    parts.append("<h2>Dependency Validation</h2><ul>")
     parts.extend(
         f"<li>{html.escape(item['Firewall'])}: {html.escape(item['Policy'])} references missing "
         f"{html.escape(item['Reference Type'].lower())} {html.escape(item['Missing Reference'])}</li>"
@@ -1007,8 +965,6 @@ def build_ha_html_report(result: HAComparison) -> bytes:
             if change.status != "Matching" and change.recommendation
         )
     )
-    if result.order_changes:
-        recommendations.append("Confirm the intended policy sequence and align both peers.")
     parts.extend(f"<li>{html.escape(item)}</li>" for item in dict.fromkeys(recommendations))
     parts.append("</ul></body></html>")
     return "".join(parts).encode("utf-8")
@@ -1026,7 +982,6 @@ def build_ha_excel_report(result: HAComparison) -> BytesIO:
     summary.append(["Equivalent Policy Matches", result.equivalent_policy_count])
     summary.append(["Modified Policy Matches", result.modified_policy_count])
     summary.append(["Missing Policies", result.missing_policy_count])
-    summary.append(["Policy Sequence Differences", len(result.order_changes)])
     summary.append(["Cosmetic Differences", result.cosmetic_count])
 
     changes_sheet = workbook.create_sheet("Object Differences")
@@ -1082,11 +1037,6 @@ def build_ha_excel_report(result: HAComparison) -> BytesIO:
     risk_sheet.append(["Risk", "Object", "Finding"])
     for item in result.risks:
         risk_sheet.append([item[key] for key in ("Risk", "Object", "Finding")])
-    order_sheet = workbook.create_sheet("Policy Order")
-    order_sheet.append(["Finding"])
-    for message in result.order_changes:
-        order_sheet.append([message])
-
     output = BytesIO()
     workbook.save(output)
     output.seek(0)
@@ -1107,8 +1057,7 @@ def build_ha_pdf_report(result: HAComparison) -> bytes:
         Paragraph(f"Health score: {result.health_score}%", styles["Heading2"]),
         Paragraph(
             f"Functional findings: {result.different_count + result.missing_count} &nbsp; "
-            f"Cosmetic differences: {result.cosmetic_count} &nbsp; "
-            f"Policy-order issues: {len(result.order_changes)}",
+            f"Cosmetic differences: {result.cosmetic_count}",
             styles["BodyText"],
         ),
     ]
@@ -1144,9 +1093,6 @@ def build_ha_pdf_report(result: HAComparison) -> bytes:
         )
     )
     story.append(table)
-    if result.order_changes:
-        story.append(Paragraph("Policy Order Issues", styles["Heading2"]))
-        story.extend(Paragraph(html.escape(item), styles["BodyText"]) for item in result.order_changes)
     if result.cosmetic_changes:
         story.append(Paragraph("Cosmetic Differences (excluded from score)", styles["Heading2"]))
         for change in result.cosmetic_changes:

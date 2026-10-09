@@ -35,6 +35,12 @@ from raw_diff import (
     compare_raw_configurations,
     render_side_by_side_document,
 )
+from session_analyzer import (
+    SessionAnalysis,
+    analyze_sessions,
+    build_session_excel_report,
+    format_traffic,
+)
 
 
 st.set_page_config(
@@ -180,6 +186,8 @@ def _object_navigation_target(
         "status": status,
         "before_id": before_id,
         "after_id": after_id,
+        "before_line": before_span.start + 1 if before_span else None,
+        "after_line": after_span.start + 1 if after_span else None,
         "before": serialize(before_span),
         "after": serialize(after_span),
     }
@@ -321,6 +329,12 @@ def _render_fullscreen_comparison(
             source_after_lines=result.after_lines,
             storage_key=f"fortigate-diff-{fingerprint}",
             navigation_target=navigation_target,
+            navigation_before_line=(
+                navigation_target.get("before_line") if navigation_target else None
+            ),
+            navigation_after_line=(
+                navigation_target.get("after_line") if navigation_target else None
+            ),
         ),
         height=780,
         scrolling=False,
@@ -831,13 +845,12 @@ def _render_ha_dashboard(
     selected_change = _render_ha_navigator(result.changes, raw_result, fingerprint)
 
     st.subheader("Policy Matching Summary")
-    summary_columns = st.columns(5)
+    summary_columns = st.columns(4)
     summary_metrics = (
         ("Exact Matches", result.exact_policy_count),
         ("Equivalent Matches", result.equivalent_policy_count),
         ("Modified Matches", result.modified_policy_count),
         ("Missing Policies", result.missing_policy_count),
-        ("Sequence Differences", len(result.order_changes)),
     )
     expanded_key = f"missing_policy_details_{fingerprint}"
     for column, (label, value) in zip(summary_columns, summary_metrics):
@@ -858,6 +871,8 @@ def _render_ha_dashboard(
     ]
     missing_changes = [change for change in policy_changes if change.status.startswith("Missing in")]
 
+    policy_table_key = f"ha_policy_table_{fingerprint}"
+
     def navigate_to_change(change: HAChange) -> None:
         if change.status == "Missing in A":
             before_id, after_id = "", change.object_id
@@ -874,6 +889,15 @@ def _render_ha_dashboard(
             change.label,
             change.status,
         )
+
+    def handle_policy_selection() -> None:
+        selection = st.session_state.get(policy_table_key)
+        selected_rows = selection.selection.rows if selection is not None else []
+        last_selected_key = f"{policy_table_key}_last_selected"
+        selected_index = selected_rows[0] if selected_rows else st.session_state.get(last_selected_key)
+        if isinstance(selected_index, int) and 0 <= selected_index < len(policy_changes):
+            st.session_state[last_selected_key] = selected_index
+            navigate_to_change(policy_changes[selected_index])
 
     def navigate_sequence(changes: list[HAChange], direction: int) -> None:
         if not changes:
@@ -929,7 +953,7 @@ def _render_ha_dashboard(
                     st.rerun()
 
     if policy_changes:
-        policy_selection = st.dataframe(
+        st.dataframe(
             pd.DataFrame(
                 [
                     {
@@ -943,19 +967,10 @@ def _render_ha_dashboard(
             ),
             use_container_width=True,
             hide_index=True,
-            on_select="rerun",
+            on_select=handle_policy_selection,
             selection_mode="single-row",
-            key=f"ha_policy_table_{fingerprint}",
+            key=policy_table_key,
         )
-        selection_key = f"ha_policy_table_selected_{fingerprint}"
-        selected_rows = policy_selection.selection.rows
-        if selected_rows:
-            selected_index = selected_rows[0]
-            if st.session_state.get(selection_key) != selected_index:
-                st.session_state[selection_key] = selected_index
-                navigate_to_change(policy_changes[selected_index])
-        else:
-            st.session_state[selection_key] = None
         for index, change in enumerate(policy_changes):
             before_id = change.before_object_id or "Missing"
             after_id = change.after_object_id or "Missing"
@@ -966,13 +981,6 @@ def _render_ha_dashboard(
             ):
                 navigate_to_change(change)
                 st.rerun()
-
-    st.subheader("Policy Sequence Differences")
-    if result.order_changes:
-        for difference in result.order_changes:
-            st.write(difference)
-    else:
-        st.caption("No policy sequence differences.")
 
     if selected_change is None:
         st.info("No modified, equivalent, or missing objects in the selected categories.")
@@ -1017,8 +1025,190 @@ def _close_fullscreen_comparison() -> None:
     st.rerun()
 
 
-def _render_setup_screen() -> None:
-    _render_compare_theme()
+def _render_session_analyzer() -> None:
+    _render_compare_header()
+    st.subheader("Session Analyzer")
+    session_text = st.text_area(
+        "Paste FortiGate Session Output",
+        height=360,
+        placeholder="Paste output from diagnose sys session list",
+        key="session_analyzer_input",
+    )
+    input_fingerprint = hashlib.sha256(session_text.encode("utf-8")).hexdigest()
+    if st.button("Analyze Sessions", type="primary", key="analyze_sessions"):
+        if not session_text.strip():
+            st.warning("Paste FortiGate session output before analyzing.")
+        else:
+            with st.spinner("Parsing session output..."):
+                st.session_state["session_analysis"] = analyze_sessions(session_text)
+                st.session_state["session_analysis_fingerprint"] = input_fingerprint
+                st.session_state.pop("session_analysis_excel", None)
+
+    if st.session_state.get("session_analysis_fingerprint") != input_fingerprint:
+        return
+    analysis: SessionAnalysis = st.session_state["session_analysis"]
+    if analysis.sessions.empty:
+        st.warning("No session blocks beginning with 'session info:' were found.")
+        return
+
+    summary = analysis.summary
+    metric_rows = (
+        (
+            ("Total Sessions", f"{summary['Total Sessions']:,}"),
+            ("Unique Sources", f"{summary['Unique Sources']:,}"),
+            ("Unique Destinations", f"{summary['Unique Destinations']:,}"),
+            ("Total Traffic", format_traffic(float(summary["Total Traffic GB"]) * 1024)),
+            ("Average Throughput", f"{summary['Average Throughput Mbps']:.3f} Mbps"),
+        ),
+        (
+            ("Highest Throughput Session", str(summary["Highest Throughput Session"])),
+            ("Longest Session", str(summary["Longest Session"])),
+            ("Sessions Without NPU Offload", f"{summary['Sessions Without NPU Offload']:,}"),
+            ("HTTP Sessions", f"{summary['HTTP Sessions']:,}"),
+            ("HTTPS Sessions", f"{summary['HTTPS Sessions']:,}"),
+        ),
+    )
+    st.subheader("Session Summary")
+    for row in metric_rows:
+        columns = st.columns(5)
+        for column, (label, value) in zip(columns, row):
+            column.metric(label, value)
+
+    st.subheader("Incident Summary")
+    st.code(analysis.incident_summary, language="text")
+
+    sessions = analysis.sessions
+    st.subheader("Search and Filters")
+    filter_columns = st.columns(6)
+    search_text = filter_columns[0].text_input("Search sessions", key="session_search")
+    source_options = sorted(sessions["Source IP"].dropna().unique())
+    destination_options = sorted(sessions["Destination IP"].dropna().unique())
+    application_options = sorted(sessions["Application"].dropna().unique())
+    port_options = sorted(int(port) for port in sessions["Port"].dropna().unique())
+    policy_options = sorted(sessions["Policy ID"].dropna().astype(str).unique())
+    state_options = sorted(sessions["Session State"].dropna().astype(str).unique())
+    source_filter = filter_columns[1].multiselect("Source IP", source_options, key="session_source_filter")
+    destination_filter = filter_columns[2].multiselect("Destination IP", destination_options, key="session_destination_filter")
+    application_filter = filter_columns[3].multiselect("Application", application_options, key="session_application_filter")
+    port_filter = filter_columns[4].multiselect("Port", port_options, key="session_port_filter")
+    policy_filter = filter_columns[5].multiselect("Policy ID", policy_options, key="session_policy_filter")
+    state_filter = st.multiselect("State", state_options, key="session_state_filter")
+
+    visible = sessions
+    filters = (
+        ("Source IP", source_filter),
+        ("Destination IP", destination_filter),
+        ("Application", application_filter),
+        ("Port", port_filter),
+        ("Policy ID", policy_filter),
+        ("Session State", state_filter),
+    )
+    for column_name, selected in filters:
+        if selected:
+            visible = visible[visible[column_name].isin(selected)]
+    if search_text:
+        search_mask = visible.astype(str).apply(
+            lambda column: column.str.contains(search_text, case=False, regex=False)
+        ).any(axis=1)
+        visible = visible[search_mask]
+    st.caption(f"Showing {len(visible):,} of {len(sessions):,} sessions")
+
+    traffic_gb_format = lambda value: format_traffic(float(value) * 1024)
+    st.subheader("All Sessions")
+    st.dataframe(
+        visible.style.format({"Total Traffic GB": traffic_gb_format, "Total Traffic MB": "{:,.2f} MB", "Current Throughput Mbps": "{:,.3f}"}),
+        width="stretch",
+        hide_index=True,
+    )
+
+    top_talkers = visible.sort_values("Total Bytes", ascending=False).head(20).loc[
+        :, ["Source IP", "Destination IP", "Port", "Application", "Duration Human Format", "Total Traffic GB", "Current Throughput Mbps"]
+    ].rename(columns={"Duration Human Format": "Duration", "Total Traffic GB": "Traffic GB"}).reset_index(drop=True)
+    longest_sessions = visible.sort_values("Duration", ascending=False).head(20).loc[
+        :, ["Source IP", "Destination IP", "Port", "Application", "Duration Human Format", "Duration", "Total Traffic GB", "Current Throughput Mbps"]
+    ].rename(columns={"Duration Human Format": "Duration Format"}).reset_index(drop=True)
+    source_analysis = (
+        visible.groupby("Source IP", dropna=False)
+        .agg(**{
+            "Session Count": ("Source IP", "size"),
+            "Total Traffic GB": ("Total Traffic GB", "sum"),
+            "Average Throughput Mbps": ("Current Throughput Mbps", "mean"),
+        })
+        .sort_values("Total Traffic GB", ascending=False)
+        .reset_index()
+    )
+    destination_analysis = (
+        visible.groupby("Destination IP", dropna=False)
+        .agg(**{
+            "Session Count": ("Destination IP", "size"),
+            "Total Traffic GB": ("Total Traffic GB", "sum"),
+        })
+        .sort_values("Total Traffic GB", ascending=False)
+        .reset_index()
+    )
+    health_findings = analysis.health_findings
+    for column_name, selected in filters:
+        if selected and column_name in health_findings.columns:
+            health_findings = health_findings[health_findings[column_name].isin(selected)]
+    if search_text:
+        for table_name, table in (
+            ("top_talkers", top_talkers),
+            ("longest_sessions", longest_sessions),
+            ("health_findings", health_findings),
+        ):
+            search_mask = table.astype(str).apply(
+                lambda column: column.str.contains(search_text, case=False, regex=False)
+            ).any(axis=1)
+            if table_name == "top_talkers":
+                top_talkers = table[search_mask]
+            elif table_name == "longest_sessions":
+                longest_sessions = table[search_mask]
+            else:
+                health_findings = table[search_mask]
+
+    st.subheader("Top 20 Sessions By Traffic")
+    st.dataframe(
+        top_talkers.style.format({"Traffic GB": traffic_gb_format, "Current Throughput Mbps": "{:,.3f}"}),
+        width="stretch",
+        hide_index=True,
+    )
+    st.subheader("Top 20 Longest Duration Sessions")
+    st.dataframe(
+        longest_sessions.style.format({"Total Traffic GB": traffic_gb_format, "Current Throughput Mbps": "{:,.3f}"}),
+        width="stretch",
+        hide_index=True,
+    )
+    st.subheader("Top Source IPs")
+    st.dataframe(
+        source_analysis.style.format({"Total Traffic GB": traffic_gb_format, "Average Throughput Mbps": "{:,.3f}"}),
+        width="stretch",
+        hide_index=True,
+    )
+    st.subheader("Top Destination IPs")
+    st.dataframe(
+        destination_analysis.style.format({"Total Traffic GB": traffic_gb_format}),
+        width="stretch",
+        hide_index=True,
+    )
+    st.subheader("Session Health Findings")
+    if health_findings.empty:
+        st.info("No health findings match the current filters.")
+    else:
+        st.dataframe(health_findings, width="stretch", hide_index=True)
+
+    excel_key = "session_analysis_excel"
+    if excel_key not in st.session_state:
+        st.session_state[excel_key] = build_session_excel_report(analysis).getvalue()
+    st.download_button(
+        "Export Excel",
+        data=st.session_state[excel_key],
+        file_name="fortigate_session_analysis.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="export_session_analysis",
+    )
+
+
+def _render_setup_screen(is_ha: bool = False) -> None:
     st.markdown(
         """
         <style>
@@ -1030,14 +1220,9 @@ def _render_setup_screen() -> None:
         unsafe_allow_html=True,
     )
     _render_compare_header()
-    comparison_mode = st.segmented_control(
-        "Comparison Type",
-        ["Pre/Post Comparison", "HA Firewall A vs Firewall B Comparison"],
-        default="Pre/Post Comparison",
-        key="comparison_mode",
-        width="stretch",
+    comparison_mode = (
+        "HA Firewall A vs Firewall B Comparison" if is_ha else "Pre/Post Comparison"
     )
-    is_ha = comparison_mode == "HA Firewall A vs Firewall B Comparison"
     policy_match_mode = (
         st.segmented_control(
             "Policy Comparison Mode",
@@ -1150,4 +1335,15 @@ def _render_fullscreen_page() -> None:
 if st.session_state.get("fullscreen_comparison_open", False):
     _render_fullscreen_page()
 else:
-    _render_setup_screen()
+    _render_compare_theme()
+    page = st.segmented_control(
+        "Page",
+        ["HA Comparison", "Configuration Comparison", "Session Analyzer"],
+        default="Configuration Comparison",
+        key="main_page",
+        width="stretch",
+    )
+    if page == "Session Analyzer":
+        _render_session_analyzer()
+    else:
+        _render_setup_screen(is_ha=page == "HA Comparison")

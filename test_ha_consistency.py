@@ -2,6 +2,7 @@ import unittest
 
 from ha_consistency import (
     HAChange,
+    POLICY_MATCH_MODES,
     build_ha_excel_report,
     build_ha_html_report,
     build_ha_pdf_report,
@@ -104,30 +105,14 @@ class HAConsistencyTests(unittest.TestCase):
         self.assertEqual(metadata_result.health_score, 100)
         self.assertEqual(metadata_result.cosmetic_count, 0)
 
-    def test_detects_policy_order_and_missing_dependencies(self):
-        reordered = BASE_CONFIG.replace(
-            " edit 10\n  set srcaddr LAN\n  set dstaddr all\n  set service WEB\n  set nat enable\n  set comments \"approved\"\n next\n edit 20",
-            " edit 20\n  set srcaddr LAN\n  set dstaddr all\n  set service WEB\n next\n edit 10\n  set srcaddr LAN\n  set dstaddr all\n  set service WEB\n  set nat enable\n  set comments \"approved\"",
-        )
+    def test_missing_policies_and_dependencies(self):
         with_missing_service = BASE_CONFIG.replace("set service WEB", "set service NOT-DEFINED", 1)
 
-        order_result = compare_ha_configurations(BASE_CONFIG, reordered)
-        sequence_result = compare_ha_configurations(
-            BASE_CONFIG,
-            reordered.replace(" edit 10\n", " edit 562\n").replace(
-                " edit 20\n", " edit 767\n"
-            ),
-            policy_match_mode="Sequence Validation",
-        )
         dependency_result = compare_ha_configurations(BASE_CONFIG, with_missing_service)
         missing_policy_result = compare_ha_configurations(
             BASE_CONFIG, BASE_CONFIG.replace(" edit 20\n  set srcaddr LAN\n  set dstaddr all\n  set service WEB\n next\n", "")
         )
 
-        self.assertTrue(order_result.order_changes)
-        self.assertEqual(sequence_result.equivalent_policy_count, 2)
-        self.assertEqual(len(sequence_result.order_changes), 2)
-        self.assertLess(order_result.health_score, 100)
         self.assertEqual(missing_policy_result.missing_policy_count, 1)
         self.assertTrue(
             any(item["Missing Reference"] == "NOT-DEFINED" for item in dependency_result.dependencies)
@@ -147,12 +132,68 @@ class HAConsistencyTests(unittest.TestCase):
         self.assertEqual(functional_result.equivalent_policy_count, 1)
         self.assertEqual(functional_result.exact_policy_count, 1)
         self.assertEqual(functional_result.health_score, 100)
+        self.assertEqual(POLICY_MATCH_MODES, ("Policy ID Match", "Functional Match"))
+        self.assertFalse(hasattr(functional_result, "order_changes"))
         equivalent = next(
             change for change in functional_result.changes if change.status == "Equivalent"
         )
         self.assertEqual(equivalent.before_object_id, "562")
         self.assertEqual(equivalent.after_object_id, "767")
         self.assertEqual(exact_differences(equivalent), [])
+
+    def test_functional_mode_pairs_similar_same_named_policies(self):
+        firewall_a = '''config firewall policy
+ edit 10
+  set name shared-access
+  set srcintf lan
+  set dstintf wan
+  set srcaddr internal
+  set dstaddr all
+  set service WEB
+  set action accept
+  set schedule always
+ next
+end
+'''
+        firewall_b = firewall_a.replace("edit 10", "edit 90").replace(
+            "set service WEB", "set service HTTPS"
+        )
+
+        result = compare_ha_configurations(
+            firewall_a, firewall_b, policy_match_mode="Functional Match"
+        )
+
+        self.assertEqual(result.missing_policy_count, 0)
+        self.assertEqual(result.equivalent_policy_count, 1)
+        equivalent = next(change for change in result.changes if change.status == "Equivalent")
+        self.assertEqual(equivalent.before_object_id, "10")
+        self.assertEqual(equivalent.after_object_id, "90")
+
+    def test_different_names_are_not_fuzzy_paired(self):
+        firewall_a = '''config firewall policy
+ edit 10
+  set name first-rule
+  set srcintf lan
+  set dstintf wan
+  set srcaddr internal
+  set dstaddr all
+  set service WEB
+  set action accept
+  set schedule always
+ next
+end
+'''
+        firewall_b = firewall_a.replace("edit 10", "edit 90").replace(
+            "set name first-rule", "set name second-rule"
+        ).replace(
+            "set service WEB", "set service HTTPS"
+        )
+
+        result = compare_ha_configurations(
+            firewall_a, firewall_b, policy_match_mode="Functional Match"
+        )
+
+        self.assertEqual(result.missing_policy_count, 2)
 
     def test_keeps_dependencies_scoped_to_vdom(self):
         config = '''config vdom
@@ -224,6 +265,8 @@ end
         self.assertIn(b"WEB", html_report)
         self.assertIn(b"ALL", html_report)
         report_text = html_report.decode("utf-8")
+        self.assertNotIn("Sequence Differences", report_text)
+        self.assertNotIn("Policy Order Issues", report_text)
         summary_start = report_text.index("<h2>Object Differences</h2>")
         self.assertLess(
             report_text.index("</table>", summary_start),
